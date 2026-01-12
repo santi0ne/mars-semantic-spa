@@ -1,11 +1,11 @@
 import uvicorn
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import tensorflow as tf
 import numpy as np
 import cv2
 from io import BytesIO
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import base64
 
 MODEL_PATH = "mars_unet_final.h5"  # nombre de modelo
@@ -49,12 +49,19 @@ except Exception as e:
 
 def process_image(image_bytes):
     """Convierte bytes -> Tensor (1, 256, 256, 3)"""
-    image = Image.open(BytesIO(image_bytes)).convert("RGB")
-    image = np.array(image)
-    image_resized = cv2.resize(image, IMG_SIZE)
-    # Normalizar a 0-1
-    input_tensor = np.expand_dims(image_resized / 255.0, axis=0)
-    return input_tensor
+    try:
+        # Intentar abrir la imagen. Si falla, PIL lanzará error.
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        image = np.array(image)
+        image_resized = cv2.resize(image, IMG_SIZE)
+        input_tensor = np.expand_dims(image_resized / 255.0, axis=0)
+        return input_tensor
+    except UnidentifiedImageError:
+        # Error específico: el archivo no es una imagen válida
+        raise HTTPException(status_code=400, detail="El archivo subido no es una imagen válida o está corrupto.")
+    except Exception as e:
+        # Cualquier otro error procesando la imagen
+        raise HTTPException(status_code=500, detail=f"Error procesando los píxeles de la imagen: {str(e)}")
 
 def tensor_to_base64(mask_indices):
     """Pinta la máscara y la convierte a string base64"""
@@ -102,25 +109,44 @@ def home():
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    image_bytes = await file.read()
+
+    if model is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="El modelo de IA no está disponible en el servidor. Contacte al administrador."
+        )
     
-    # pre-procesar
-    input_tensor = process_image(image_bytes)
-    
-    # predecir
-    prediction = model.predict(input_tensor)
-    mask_indices = np.argmax(prediction, axis=-1)[0]
-    
-    # formatear respuesta
-    mask_b64 = tensor_to_base64(mask_indices)
-    status, msg, stats = analyze_viability(mask_indices)
-    
-    return {
-        "filename": file.filename,
-        "segmentation_map": mask_b64,
-        "viability": {
-            "status": status,
-            "message": msg,
-            "composition": stats
+    try:
+        image_bytes = await file.read()
+
+        if len(image_bytes) == 0:
+                raise HTTPException(status_code=400, detail="El archivo subido está vacío.")
+        
+        # pre-procesar
+        input_tensor = process_image(image_bytes)
+        
+        # predecir
+        prediction = model.predict(input_tensor)
+        mask_indices = np.argmax(prediction, axis=-1)[0]
+        
+        # formatear respuesta
+        mask_b64 = tensor_to_base64(mask_indices)
+        status, msg, stats = analyze_viability(mask_indices)
+        
+        return {
+            "filename": file.filename,
+            "segmentation_map": mask_b64,
+            "viability": {
+                "status": status,
+                "message": msg,
+                "composition": stats
+            }
         }
-    }
+    except HTTPException as http_ex:
+        raise http_ex
+    except Exception as e:
+        print(f"Error interno: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail="Ocurrió un error interno analizando la imagen. Inténtelo de nuevo."
+        )
